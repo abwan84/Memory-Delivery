@@ -13,7 +13,13 @@
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "UIBackgroundModes": ["location", "fetch"],
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "Memory Delivery needs your location even when the app is closed to notify you when you're near a saved memory.",
+        "NSLocationAlwaysUsageDescription": "Memory Delivery needs your location even when the app is closed to notify you when you're near a saved memory.",
+        "NSLocationWhenInUseUsageDescription": "Memory Delivery needs your location to show nearby memories and save new ones."
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -21,10 +27,38 @@
         "backgroundColor": "#ffffff"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_LOCATION",
+        "RECEIVE_BOOT_COMPLETED"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "plugins": [
+      "expo-font",
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Memory Delivery needs your location even when the app is closed to notify you when you're near a saved memory.",
+          "locationAlwaysPermission": "Memory Delivery needs background location access to alert you when you're near saved memories.",
+          "locationWhenInUsePermission": "Memory Delivery needs your location to show nearby memories.",
+          "isIosBackgroundLocationEnabled": true,
+          "isAndroidBackgroundLocationEnabled": true
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/icon.png",
+          "color": "#E67E22"
+        }
+      ]
+    ]
   }
 }

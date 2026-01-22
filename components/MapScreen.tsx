@@ -1,14 +1,45 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { StyleSheet, View, Text, TouchableOpacity, TextInput, ScrollView, Platform, Alert, Dimensions } from 'react-native';
+import { StyleSheet, View, Text, TouchableOpacity, TextInput, ScrollView, Platform, Alert, Dimensions, ActivityIndicator, ImageBackground } from 'react-native';
 import MapView, { Region, Marker } from 'react-native-maps';
 import { LocationObject } from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { useFonts, NanumPenScript_400Regular } from '@expo-google-fonts/nanum-pen-script';
+
+// 지오펜싱 서비스
+import { 
+  registerGeofenceForMemory, 
+  unregisterGeofenceForMemory,
+  GEOFENCE_RADIUS 
+} from '../services/GeofencingService';
+
+// 코르크보드 배경 이미지
+const corkboardBg = require('../assets/corkboard-bg.jpg');
 
 // #region agent log
 const debugLog = (location: string, message: string, data: object, hypothesisId: string) => {
   fetch('http://127.0.0.1:7242/ingest/0595a1ca-db13-40a1-91db-65b59f7fff34',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location,message,data,timestamp:Date.now(),sessionId:'debug-session',hypothesisId})}).catch(()=>{});
 };
 // #endregion
+
+// ============================================
+// 파스텔 색상 팔레트 & 헬퍼 함수
+// ============================================
+const PASTEL_COLORS = [
+  '#FFF7D1', // Yellow
+  '#FFD1DC', // Pink
+  '#D1EAFF', // Blue
+  '#D1FFD6', // Green
+  '#E8D1FF', // Purple
+  '#FFE4D1', // Peach
+];
+
+function getRandomColor(): string {
+  return PASTEL_COLORS[Math.floor(Math.random() * PASTEL_COLORS.length)];
+}
+
+function getRandomRotation(): number {
+  return Math.random() * 10 - 5;
+}
 
 // Memory 데이터 타입 정의
 interface Memory {
@@ -17,15 +48,16 @@ interface Memory {
   latitude: number;
   longitude: number;
   date: string;
+  color: string;
+  rotation: number;
+  isImportant: boolean;
 }
 
 const STORAGE_KEY = '@memories';
-const PROXIMITY_THRESHOLD = 50; // 50 meters
-const { height: SCREEN_HEIGHT } = Dimensions.get('window');
+const PROXIMITY_THRESHOLD = 50;
+const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
-// ============================================
-// Haversine 공식을 사용한 거리 계산 헬퍼 함수
-// ============================================
+// Haversine 공식
 function getDistanceFromLatLonInMeters(
   lat1: number,
   lon1: number,
@@ -51,28 +83,32 @@ function deg2rad(deg: number): number {
 
 function formatDistance(meters: number): string {
   if (meters < 1000) {
-    return `${Math.round(meters)}m away`;
+    return `${Math.round(meters)}m`;
   }
-  return `${(meters / 1000).toFixed(1)}km away`;
+  return `${(meters / 1000).toFixed(1)}km`;
 }
 
 interface MapScreenProps {
   location: LocationObject;
+  backgroundPermissionGranted?: boolean;
 }
 
-export default function MapScreen({ location }: MapScreenProps) {
+export default function MapScreen({ location, backgroundPermissionGranted }: MapScreenProps) {
+  // 나눔손글씨 폰트 로드
+  const [fontsLoaded] = useFonts({
+    NanumPenScript_400Regular,
+  });
+
   const [memoryText, setMemoryText] = useState('');
   const [memories, setMemories] = useState<Memory[]>([]);
   const [saveMessage, setSaveMessage] = useState('');
   
-  // 시뮬레이션 모드
   const [isSimulating, setIsSimulating] = useState(false);
   const [simulatedOffset, setSimulatedOffset] = useState(0);
   
   const alertedMemoriesRef = useRef<Set<string>>(new Set());
   const mapRef = useRef<MapView>(null);
 
-  // 현재 사용할 위치 (실제 또는 시뮬레이션)
   const currentLat = location.coords.latitude + simulatedOffset;
   const currentLon = location.coords.longitude;
 
@@ -82,12 +118,10 @@ export default function MapScreen({ location }: MapScreenProps) {
   }, []);
   // #endregion
 
-  // 앱 시작시 저장된 메모리 불러오기
   useEffect(() => {
     loadMemories();
   }, []);
 
-  // 근접 체크 로직
   useEffect(() => {
     if (!location || !location.coords || memories.length === 0) return;
 
@@ -115,7 +149,14 @@ export default function MapScreen({ location }: MapScreenProps) {
     try {
       const storedMemories = await AsyncStorage.getItem(STORAGE_KEY);
       if (storedMemories) {
-        setMemories(JSON.parse(storedMemories));
+        const parsed = JSON.parse(storedMemories);
+        const migrated = parsed.map((m: Memory) => ({
+          ...m,
+          color: m.color || getRandomColor(),
+          rotation: m.rotation !== undefined ? m.rotation : getRandomRotation(),
+          isImportant: m.isImportant ?? false,
+        }));
+        setMemories(migrated);
       }
     } catch (error) {
       console.error('메모리 불러오기 실패:', error);
@@ -140,14 +181,26 @@ export default function MapScreen({ location }: MapScreenProps) {
         latitude: location.coords.latitude,
         longitude: location.coords.longitude,
         date: new Date().toLocaleString('ko-KR'),
+        color: getRandomColor(),
+        rotation: getRandomRotation(),
+        isImportant: false,
       };
 
       const updatedMemories = [...memories, newMemory];
       await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(updatedMemories));
       setMemories(updatedMemories);
       setMemoryText('');
-      showMessage('✨ Memory Saved!');
-      debugLog('MapScreen.tsx:saveMemory', 'Memory saved', { memory: newMemory }, 'A');
+      
+      // 지오펜스 등록 (백그라운드 알림용)
+      if (backgroundPermissionGranted) {
+        await registerGeofenceForMemory(newMemory);
+        showMessage('✨ Memory Saved! (알림 활성화)');
+        console.log(`📍 [MapScreen] Geofence registered for memory ${newMemory.id} at radius ${GEOFENCE_RADIUS}m`);
+      } else {
+        showMessage('✨ Memory Saved!');
+      }
+      
+      debugLog('MapScreen.tsx:saveMemory', 'Memory saved', { memory: newMemory, geofenceRegistered: backgroundPermissionGranted }, 'A');
     } catch (error) {
       console.error('메모리 저장 실패:', error);
       showMessage('❌ 저장에 실패했습니다.');
@@ -181,9 +234,19 @@ export default function MapScreen({ location }: MapScreenProps) {
   debugLog('MapScreen.tsx:render', 'MapScreen rendering', { platform: Platform.OS }, 'B');
   // #endregion
 
+  // 폰트 로딩 중
+  if (!fontsLoaded) {
+    return (
+      <View style={styles.loadingContainer}>
+        <ActivityIndicator size="large" color="#8B4513" />
+        <Text style={styles.loadingText}>Loading fonts...</Text>
+      </View>
+    );
+  }
+
   return (
     <View style={styles.container}>
-      {/* 지도 영역 (상단 45%) */}
+      {/* 지도 영역 */}
       <View style={styles.mapContainer}>
         <MapView
           ref={mapRef}
@@ -193,7 +256,6 @@ export default function MapScreen({ location }: MapScreenProps) {
           showsMyLocationButton={true}
           showsCompass={true}
         >
-          {/* 시뮬레이션 모드일 때 가상 위치 마커 */}
           {isSimulating && (
             <Marker
               coordinate={{ latitude: currentLat, longitude: currentLon }}
@@ -202,7 +264,6 @@ export default function MapScreen({ location }: MapScreenProps) {
             />
           )}
           
-          {/* 메모리 마커들 */}
           {memories.map((memory) => {
             const distance = getDistanceFromLatLonInMeters(
               currentLat,
@@ -217,33 +278,33 @@ export default function MapScreen({ location }: MapScreenProps) {
                 key={memory.id}
                 coordinate={{ latitude: memory.latitude, longitude: memory.longitude }}
                 title={isUnlocked ? memory.text : '🔒 Locked'}
-                description={formatDistance(distance)}
+                description={`${formatDistance(distance)} away`}
                 pinColor={isUnlocked ? '#f59e0b' : '#9ca3af'}
               />
             );
           })}
         </MapView>
 
-        {/* 시뮬레이션 배지 */}
         {isSimulating && (
           <View style={styles.simulationBadge}>
             <Text style={styles.simulationBadgeText}>🎮 SIMULATION</Text>
           </View>
         )}
-      </View>
 
-      {/* 하단 콘텐츠 영역 */}
-      <ScrollView style={styles.bottomContainer} contentContainerStyle={styles.bottomContent}>
         {/* 디버그 버튼 */}
-        <View style={styles.debugButtonContainer}>
-          <TouchableOpacity style={styles.teleportButton} onPress={handleTeleport}>
-            <Text style={styles.teleportButtonText}>🚀 Teleport</Text>
+        <View style={styles.mapButtonContainer}>
+          <TouchableOpacity style={styles.mapButton} onPress={handleTeleport}>
+            <Text style={styles.mapButtonText}>🚀</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.resetButton} onPress={handleResetLocation}>
-            <Text style={styles.resetButtonText}>📍 Reset</Text>
+          <TouchableOpacity style={styles.mapButton} onPress={handleResetLocation}>
+            <Text style={styles.mapButtonText}>📍</Text>
           </TouchableOpacity>
         </View>
+      </View>
 
+      {/* 하단 스티키 노트 월 */}
+      <ImageBackground source={corkboardBg} style={styles.bottomContainer} resizeMode="cover">
+        <ScrollView style={styles.scrollContainer} contentContainerStyle={styles.bottomContent}>
         {/* 입력 영역 */}
         <View style={styles.inputSection}>
           <TextInput
@@ -256,65 +317,97 @@ export default function MapScreen({ location }: MapScreenProps) {
             numberOfLines={2}
           />
           <TouchableOpacity style={styles.saveButton} onPress={handleSaveMemory}>
-            <Text style={styles.saveButtonIcon}>📌</Text>
-            <Text style={styles.saveButtonText}>Stick Memory</Text>
+            <Text style={styles.saveButtonText}>📌 Stick Memory</Text>
           </TouchableOpacity>
           {saveMessage ? <Text style={styles.saveMessage}>{saveMessage}</Text> : null}
         </View>
 
-        {/* 메모리 리스트 */}
-        <View style={styles.memorySection}>
-          <Text style={styles.sectionTitle}>📋 저장된 메모리 ({memories.length}개)</Text>
+        {/* Sticky Note Wall */}
+        <View style={styles.corkboard}>
+          <Text style={styles.wallTitle}>🗒️ Memory Wall ({memories.length})</Text>
+          
           {memories.length === 0 ? (
-            <Text style={styles.emptyText}>아직 저장된 메모리가 없습니다.</Text>
+            <View style={styles.emptyState}>
+              <Text style={styles.emptyIcon}>📭</Text>
+              <Text style={styles.emptyText}>아직 추억이 없습니다</Text>
+            </View>
           ) : (
-            memories.map((memory) => {
-              const distance = getDistanceFromLatLonInMeters(
-                currentLat,
-                currentLon,
-                memory.latitude,
-                memory.longitude
-              );
-              const isUnlocked = distance < PROXIMITY_THRESHOLD;
+            <View style={styles.notesGrid}>
+              {memories.map((memory) => {
+                const distance = getDistanceFromLatLonInMeters(
+                  currentLat,
+                  currentLon,
+                  memory.latitude,
+                  memory.longitude
+                );
+                const isUnlocked = distance < PROXIMITY_THRESHOLD;
 
-              return (
-                <View
-                  key={memory.id}
-                  style={[
-                    styles.memoryCard,
-                    isUnlocked ? styles.memoryCardUnlocked : styles.memoryCardLocked,
-                  ]}
-                >
-                  <View style={styles.statusBadge}>
-                    <Text style={styles.statusIcon}>{isUnlocked ? '🔓' : '🔒'}</Text>
-                    <Text style={[styles.distanceText, isUnlocked ? styles.distanceUnlocked : styles.distanceLocked]}>
-                      {formatDistance(distance)}
-                    </Text>
+                return (
+                  <View
+                    key={memory.id}
+                    style={[
+                      styles.stickyNote,
+                      {
+                        backgroundColor: isUnlocked ? memory.color : '#E0E0E0',
+                        transform: [{ rotate: `${memory.rotation}deg` }],
+                      },
+                    ]}
+                  >
+                    <View style={styles.pinContainer}>
+                      <Text style={styles.pinIcon}>📌</Text>
+                    </View>
+
+                    {!isUnlocked && (
+                      <View style={styles.lockSticker}>
+                        <Text style={styles.lockIcon}>🔒</Text>
+                      </View>
+                    )}
+
+                    <View style={styles.noteContent}>
+                      {isUnlocked ? (
+                        <Text style={styles.noteText} numberOfLines={3}>
+                          {memory.text}
+                        </Text>
+                      ) : (
+                        <Text style={styles.lockedText}>Visit to unlock!</Text>
+                      )}
+                    </View>
+
+                    <View style={styles.noteFooter}>
+                      <Text style={styles.distanceBadge}>📍 {formatDistance(distance)}</Text>
+                    </View>
                   </View>
-                  {isUnlocked ? (
-                    <Text style={styles.memoryText}>📝 {memory.text}</Text>
-                  ) : (
-                    <Text style={styles.memoryTextLocked}>🔒 Visit this location to unlock memory.</Text>
-                  )}
-                  <Text style={styles.memoryDate}>🕐 {memory.date}</Text>
-                </View>
-              );
-            })
+                );
+              })}
+            </View>
           )}
         </View>
-      </ScrollView>
+        </ScrollView>
+      </ImageBackground>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
+  // 로딩 화면
+  loadingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#D4A574',
+  },
+  loadingText: {
+    marginTop: 12,
+    fontSize: 16,
+    color: '#5D3A1A',
+  },
   container: {
     flex: 1,
-    backgroundColor: '#1a1a2e',
+    backgroundColor: '#D4A574',
   },
   // 지도 영역
   mapContainer: {
-    height: SCREEN_HEIGHT * 0.45,
+    height: SCREEN_HEIGHT * 0.35,
     position: 'relative',
   },
   map: {
@@ -334,152 +427,186 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: '700',
   },
+  mapButtonContainer: {
+    position: 'absolute',
+    bottom: 16,
+    right: 16,
+    gap: 8,
+  },
+  mapButton: {
+    backgroundColor: '#8B4513',
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+    elevation: 5,
+  },
+  mapButtonText: {
+    fontSize: 20,
+  },
   // 하단 콘텐츠
   bottomContainer: {
     flex: 1,
   },
+  scrollContainer: {
+    flex: 1,
+  },
   bottomContent: {
-    padding: 16,
     paddingBottom: 40,
-  },
-  debugButtonContainer: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    gap: 12,
-    marginBottom: 16,
-  },
-  teleportButton: {
-    backgroundColor: '#8b5cf6',
-    paddingVertical: 8,
-    paddingHorizontal: 16,
-    borderRadius: 20,
-  },
-  teleportButtonText: {
-    color: '#ffffff',
-    fontSize: 13,
-    fontWeight: '600',
-  },
-  resetButton: {
-    backgroundColor: '#374151',
-    paddingVertical: 8,
-    paddingHorizontal: 16,
-    borderRadius: 20,
-    borderWidth: 1,
-    borderColor: '#6b7280',
-  },
-  resetButtonText: {
-    color: '#d1d5db',
-    fontSize: 13,
-    fontWeight: '600',
   },
   // 입력 영역
   inputSection: {
-    alignItems: 'center',
-    marginBottom: 20,
+    margin: 12,
+    padding: 16,
+    backgroundColor: '#FFF7D1',
+    borderRadius: 4,
+    shadowColor: '#000',
+    shadowOffset: { width: 3, height: 3 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    elevation: 5,
+    transform: [{ rotate: '-1deg' }],
   },
   stickyNoteInput: {
-    width: '100%',
-    minHeight: 80,
-    backgroundColor: '#FFF7D6',
-    borderRadius: 12,
-    padding: 14,
-    fontSize: 15,
-    color: '#5a5230',
+    minHeight: 60,
+    backgroundColor: '#FFFEF5',
+    borderRadius: 4,
+    padding: 12,
+    fontSize: 18,
+    fontFamily: 'NanumPenScript_400Regular',
+    color: '#333',
     textAlignVertical: 'top',
     borderWidth: 1,
-    borderColor: '#e8dfa3',
+    borderColor: '#E8DFA3',
   },
   saveButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#f59e0b',
+    backgroundColor: '#E67E22',
     paddingVertical: 12,
-    paddingHorizontal: 24,
+    paddingHorizontal: 20,
     borderRadius: 25,
     marginTop: 12,
-  },
-  saveButtonIcon: {
-    fontSize: 18,
-    marginRight: 8,
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.25,
+    shadowRadius: 4,
+    elevation: 5,
   },
   saveButtonText: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: '#ffffff',
+    fontSize: 18,
+    fontFamily: 'NanumPenScript_400Regular',
+    color: '#FFF',
   },
   saveMessage: {
-    marginTop: 10,
+    marginTop: 8,
     fontSize: 14,
-    color: '#10b981',
+    color: '#27AE60',
     fontWeight: '600',
-  },
-  // 메모리 리스트
-  memorySection: {
-    borderTopWidth: 1,
-    borderTopColor: '#333355',
-    paddingTop: 16,
-  },
-  sectionTitle: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: '#ffffff',
-    marginBottom: 12,
     textAlign: 'center',
+  },
+  // 코르크보드
+  corkboard: {
+    flex: 1,
+    padding: 12,
+  },
+  wallTitle: {
+    fontSize: 24,
+    fontFamily: 'NanumPenScript_400Regular',
+    color: '#5D3A1A',
+    textAlign: 'center',
+    marginBottom: 16,
+  },
+  emptyState: {
+    alignItems: 'center',
+    paddingVertical: 40,
+  },
+  emptyIcon: {
+    fontSize: 50,
+    marginBottom: 12,
   },
   emptyText: {
-    fontSize: 14,
-    color: '#888888',
-    textAlign: 'center',
-    fontStyle: 'italic',
+    fontSize: 20,
+    fontFamily: 'NanumPenScript_400Regular',
+    color: '#5D3A1A',
   },
-  memoryCard: {
-    borderRadius: 12,
-    padding: 14,
-    marginBottom: 10,
-    borderLeftWidth: 4,
-  },
-  memoryCardUnlocked: {
-    backgroundColor: '#FFF9C4',
-    borderLeftColor: '#f59e0b',
-  },
-  memoryCardLocked: {
-    backgroundColor: '#3a3a5e',
-    borderLeftColor: '#666680',
-    opacity: 0.8,
-  },
-  statusBadge: {
+  // 그리드
+  notesGrid: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  // 스티키 노트
+  stickyNote: {
+    width: '47%',
+    aspectRatio: 1,
+    padding: 10,
+    borderRadius: 3,
+    position: 'relative',
+    shadowColor: '#000',
+    shadowOffset: { width: 3, height: 3 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    elevation: 5,
+  },
+  pinContainer: {
+    position: 'absolute',
+    top: -6,
+    left: '50%',
+    marginLeft: -8,
+    zIndex: 10,
+  },
+  pinIcon: {
+    fontSize: 16,
+  },
+  lockSticker: {
+    position: 'absolute',
+    top: 6,
+    right: 6,
+    backgroundColor: '#FF6B6B',
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    justifyContent: 'center',
     alignItems: 'center',
-    marginBottom: 6,
+    elevation: 3,
   },
-  statusIcon: {
+  lockIcon: {
     fontSize: 14,
-    marginRight: 6,
   },
-  distanceText: {
-    fontSize: 12,
-    fontWeight: '600',
+  noteContent: {
+    flex: 1,
+    marginTop: 12,
+    justifyContent: 'center',
   },
-  distanceUnlocked: {
-    color: '#d97706',
+  noteText: {
+    fontSize: 16,
+    fontFamily: 'NanumPenScript_400Regular',
+    color: '#333',
+    lineHeight: 22,
   },
-  distanceLocked: {
-    color: '#888888',
-  },
-  memoryText: {
-    fontSize: 15,
-    marginBottom: 6,
-    lineHeight: 20,
-    color: '#5a5230',
-  },
-  memoryTextLocked: {
+  lockedText: {
     fontSize: 14,
-    color: '#888888',
-    fontStyle: 'italic',
-    marginBottom: 6,
+    fontFamily: 'NanumPenScript_400Regular',
+    color: '#888',
+    textAlign: 'center',
   },
-  memoryDate: {
-    fontSize: 11,
-    color: '#666666',
+  noteFooter: {
+    marginTop: 6,
+  },
+  distanceBadge: {
+    fontSize: 10,
+    color: '#666',
+    backgroundColor: 'rgba(255,255,255,0.5)',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 8,
+    alignSelf: 'flex-start',
+    overflow: 'hidden',
   },
 });
