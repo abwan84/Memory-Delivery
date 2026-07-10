@@ -12,6 +12,7 @@ import { useFonts, NanumPenScript_400Regular } from '@expo-google-fonts/nanum-pe
 import { 
   registerGeofenceForMemory, 
   unregisterGeofenceForMemory,
+  sendArrivalNotification,
   GEOFENCE_RADIUS,
   GEOFENCE_RADIUS_OPTIONS,
   GeofenceRadius,
@@ -267,12 +268,15 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
       );
 
       if (distance < getMemoryRadius(memory) && !alertedMemoriesRef.current.has(memory.id)) {
-        Alert.alert(
-          '🎉 Memory Found!',
-          `"${memory.text}"\n\nSaved on: ${memory.date}`,
-          [{ text: 'OK' }]
-        );
         alertedMemoriesRef.current.add(memory.id);
+        sendArrivalNotification(memory).catch((error) => {
+          console.error('[MapScreen] Failed to show arrival notification:', error);
+          Alert.alert(
+            '위치 메모 도착',
+            `"${memory.text}"\n\n저장일: ${memory.date}`,
+            [{ text: '확인' }]
+          );
+        });
         debugLog('MapScreen.tsx:geofence', 'Memory unlocked!', { memoryId: memory.id, distance }, 'A');
       } else if (distance >= getMemoryRadius(memory)) {
         alertedMemoriesRef.current.delete(memory.id);
@@ -345,6 +349,7 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
       const updatedMemories = [...memories, newMemory];
       await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(updatedMemories));
       setMemories(updatedMemories);
+      alertedMemoriesRef.current.add(newMemory.id);
       setMemoryText('');
       setSelectedImageUri(undefined);
       setSelectedRadius(GEOFENCE_RADIUS);

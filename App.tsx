@@ -3,6 +3,7 @@ import { StatusBar } from 'expo-status-bar';
 import { Alert, Platform } from 'react-native';
 import * as Location from 'expo-location';
 import { LocationObject } from 'expo-location';
+import Constants, { ExecutionEnvironment } from 'expo-constants';
 
 import MapScreen from './components/MapScreen';
 import LoadingScreen from './components/LoadingScreen';
@@ -22,6 +23,8 @@ const debugLog = (location: string, message: string, data: object, hypothesisId:
 // #endregion
 
 type AppState = 'loading' | 'granted' | 'denied';
+
+const isExpoGo = Constants.executionEnvironment === ExecutionEnvironment.StoreClient;
 
 export default function App() {
   const [appState, setAppState] = useState<AppState>('loading');
@@ -63,8 +66,11 @@ export default function App() {
       setLocation(currentLocation);
       setAppState('granted');
 
+      // Expo Go can show local notifications while the app is open.
+      await requestNotificationPermission();
+
       // 3. 네이티브 플랫폼에서만 백그라운드 권한 요청
-      if (Platform.OS !== 'web') {
+      if (Platform.OS !== 'web' && !isExpoGo) {
         await requestBackgroundPermissions();
       }
 
@@ -163,6 +169,37 @@ export default function App() {
   useEffect(() => {
     requestLocationPermission();
   }, []);
+
+  useEffect(() => {
+    if (appState !== 'granted' || Platform.OS === 'web') return;
+
+    let isMounted = true;
+    let subscription: Location.LocationSubscription | null = null;
+
+    Location.watchPositionAsync(
+      {
+        accuracy: Location.Accuracy.High,
+        distanceInterval: 3,
+        timeInterval: 3000,
+      },
+      (nextLocation) => setLocation(nextLocation)
+    )
+      .then((nextSubscription) => {
+        if (isMounted) {
+          subscription = nextSubscription;
+        } else {
+          nextSubscription.remove();
+        }
+      })
+      .catch((error) => {
+        console.error('[App] Failed to watch foreground location:', error);
+      });
+
+    return () => {
+      isMounted = false;
+      subscription?.remove();
+    };
+  }, [appState]);
 
   // Render based on app state
   if (appState === 'loading') {

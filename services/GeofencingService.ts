@@ -12,6 +12,7 @@ export const STORAGE_KEY = '@memories';
 export const GEOFENCE_RADIUS = 100; // meters
 export const GEOFENCE_RADIUS_OPTIONS = [50, 100, 200] as const;
 export type GeofenceRadius = typeof GEOFENCE_RADIUS_OPTIONS[number];
+const ARRIVAL_NOTIFICATION_CHANNEL = 'memory-arrivals';
 
 // Memory 타입 정의
 interface Memory {
@@ -30,6 +31,20 @@ function getMemoryRadius(memory: Memory): GeofenceRadius {
   return GEOFENCE_RADIUS_OPTIONS.includes(memory.notificationRadius as GeofenceRadius)
     ? memory.notificationRadius as GeofenceRadius
     : GEOFENCE_RADIUS;
+}
+
+export async function sendArrivalNotification(memory: Memory): Promise<void> {
+  await Notifications.scheduleNotificationAsync({
+    content: {
+      title: memory.isImportant ? '중요한 위치 메모에 도착했어요' : '위치 메모에 도착했어요',
+      body: `"${memory.text.substring(0, 50)}${memory.text.length > 50 ? '...' : ''}"`,
+      data: { memoryId: memory.id },
+      sound: true,
+    },
+    trigger: Platform.OS === 'android'
+      ? { channelId: ARRIVAL_NOTIFICATION_CHANNEL }
+      : null,
+  });
 }
 
 // 알림된 메모리 추적 (중복 알림 방지)
@@ -96,15 +111,7 @@ TaskManager.defineTask(GEOFENCING_TASK, async ({ data, error }) => {
           
           if (memory) {
             // 알림 표시
-            await Notifications.scheduleNotificationAsync({
-              content: {
-                title: memory.isImportant ? '⭐ 중요한 추억이 근처에!' : '📝 추억이 근처에!',
-                body: `"${memory.text.substring(0, 50)}${memory.text.length > 50 ? '...' : ''}"`,
-                data: { memoryId: memory.id },
-                sound: true,
-              },
-              trigger: null, // 즉시 표시
-            });
+            await sendArrivalNotification(memory);
             
             console.log('🔔 [GeofencingTask] Notification sent for memory:', memory.id);
             
@@ -173,6 +180,15 @@ export async function requestBackgroundLocationPermission(): Promise<boolean> {
  */
 export async function requestNotificationPermission(): Promise<boolean> {
   console.log('🔔 [Permissions] Requesting notification permission...');
+
+  if (Platform.OS === 'android') {
+    await Notifications.setNotificationChannelAsync(ARRIVAL_NOTIFICATION_CHANNEL, {
+      name: '도착 알림',
+      importance: Notifications.AndroidImportance.MAX,
+      sound: 'default',
+      vibrationPattern: [0, 250, 250, 250],
+    });
+  }
   
   const { status: existingStatus } = await Notifications.getPermissionsAsync();
   let finalStatus = existingStatus;
