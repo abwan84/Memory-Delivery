@@ -10,15 +10,22 @@ import {
   Dimensions, 
   ActivityIndicator, 
   ImageBackground,
+  Image,
   Modal,
   Pressable,
 } from 'react-native';
 import { LocationObject } from 'expo-location';
+import * as ImagePicker from 'expo-image-picker';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFonts, NanumPenScript_400Regular } from '@expo-google-fonts/nanum-pen-script';
 import { MapContainer, TileLayer, Marker, Popup, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
+import {
+  GEOFENCE_RADIUS,
+  GEOFENCE_RADIUS_OPTIONS,
+  GeofenceRadius,
+} from '../services/GeofencingService';
 
 // Feather 아이콘 SVG 컴포넌트 (웹 호환)
 interface FeatherIconProps {
@@ -86,6 +93,8 @@ interface Memory {
   color: string;
   rotation: number;
   isImportant: boolean;
+  notificationRadius?: GeofenceRadius;
+  imageUri?: string;
   visibility: MemoryVisibility;
   duration?: number; // hours
   expiresAt?: number; // timestamp (ms)
@@ -185,10 +194,15 @@ async function cleanupExpiredMemories(storageKey: string): Promise<Memory[]> {
 type FilterType = 'all' | 'important' | 'general' | 'private' | 'public';
 
 const STORAGE_KEY = '@memories';
-const PROXIMITY_THRESHOLD = 50;
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
 const NOTE_SIZE = SCREEN_WIDTH > 768 ? 180 : SCREEN_WIDTH > 480 ? 140 : (SCREEN_WIDTH - 48) / 2;
+
+function getMemoryRadius(memory: Memory): GeofenceRadius {
+  return GEOFENCE_RADIUS_OPTIONS.includes(memory.notificationRadius as GeofenceRadius)
+    ? memory.notificationRadius as GeofenceRadius
+    : GEOFENCE_RADIUS;
+}
 
 // Haversine 공식
 function getDistanceFromLatLonInMeters(
@@ -338,6 +352,8 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
   const [selectedMemory, setSelectedMemory] = useState<Memory | null>(null);
   const [newMemoryText, setNewMemoryText] = useState('');
   const [newMemoryIsImportant, setNewMemoryIsImportant] = useState(false);
+  const [selectedImageUri, setSelectedImageUri] = useState<string | undefined>();
+  const [selectedRadius, setSelectedRadius] = useState<GeofenceRadius>(GEOFENCE_RADIUS);
   
   // Visibility & Duration 상태
   const [selectedVisibility, setSelectedVisibility] = useState<MemoryVisibility>('private');
@@ -393,7 +409,7 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
   // 메모리별 마커 상태 계산
   const getMarkerStatus = (memory: Memory): 'locked' | 'unlocked' | 'important' => {
     const distance = getDistanceFromLatLonInMeters(currentLat, currentLon, memory.latitude, memory.longitude);
-    const isUnlocked = distance < PROXIMITY_THRESHOLD;
+    const isUnlocked = distance < getMemoryRadius(memory);
     if (memory.isImportant) return 'important';
     if (isUnlocked) return 'unlocked';
     return 'locked';
@@ -413,13 +429,15 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
 
     memories.forEach((memory) => {
       const distance = getDistanceFromLatLonInMeters(currentLat, currentLon, memory.latitude, memory.longitude);
-      if (distance < PROXIMITY_THRESHOLD && !alertedMemoriesRef.current.has(memory.id)) {
+      if (distance < getMemoryRadius(memory) && !alertedMemoriesRef.current.has(memory.id)) {
         const message = `🎉 You found a memory!\n\n"${memory.text}"\n\nSaved on: ${memory.date}`;
         if (Platform.OS === 'web') {
           window.alert(message);
         }
         alertedMemoriesRef.current.add(memory.id);
         debugLog('MapScreen.web.tsx:geofence', 'Memory unlocked!', { memoryId: memory.id, distance }, 'A');
+      } else if (distance >= getMemoryRadius(memory)) {
+        alertedMemoriesRef.current.delete(memory.id);
       }
     });
   }, [location, memories, simulatedOffset]);
@@ -444,6 +462,7 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
         color: m.color || getRandomColor(),
         rotation: m.rotation !== undefined ? m.rotation : getRandomRotation(),
         isImportant: m.isImportant ?? false,
+        notificationRadius: getMemoryRadius(m),
         visibility: m.visibility ?? 'private',
         author: m.author ?? 'Me',
         isMine: m.isMine ?? true,
@@ -468,6 +487,8 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
         color: getRandomColor(),
         rotation: getRandomRotation(),
         isImportant: newMemoryIsImportant,
+        notificationRadius: selectedRadius,
+        imageUri: selectedImageUri,
         visibility: selectedVisibility,
         duration: isPublic ? selectedDuration : undefined,
         expiresAt: isPublic ? Date.now() + selectedDuration * 60 * 60 * 1000 : undefined,
@@ -480,6 +501,8 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
       setMemories(updatedMemories);
       setNewMemoryText('');
       setNewMemoryIsImportant(false);
+      setSelectedImageUri(undefined);
+      setSelectedRadius(GEOFENCE_RADIUS);
       setSelectedVisibility('private');
       setSelectedDuration(24);
       setIsWriteModalVisible(false);
@@ -518,6 +541,24 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
     }
   };
 
+  const handlePickImage = async () => {
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['images'],
+      allowsEditing: true,
+      aspect: [4, 3],
+      quality: 0.8,
+      base64: true,
+    });
+
+    if (!result.canceled && result.assets[0]) {
+      const asset = result.assets[0];
+      const persistentUri = asset.base64
+        ? `data:${asset.mimeType || 'image/jpeg'};base64,${asset.base64}`
+        : asset.uri;
+      setSelectedImageUri(persistentUri);
+    }
+  };
+
   const openReadModal = (memory: Memory) => {
     setSelectedMemory(memory);
     setIsReadModalVisible(true);
@@ -526,6 +567,8 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
   const openWriteModal = () => {
     setNewMemoryText('');
     setNewMemoryIsImportant(false);
+    setSelectedImageUri(undefined);
+    setSelectedRadius(GEOFENCE_RADIUS);
     setSelectedVisibility('private');
     setSelectedDuration(24);
     setIsWriteModalVisible(true);
@@ -661,7 +704,7 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
             <View style={styles.notesGrid}>
               {filteredMemories.map((memory) => {
                 const distance = getDistanceFromLatLonInMeters(currentLat, currentLon, memory.latitude, memory.longitude);
-                const isUnlocked = distance < PROXIMITY_THRESHOLD;
+                const isUnlocked = distance < getMemoryRadius(memory);
 
                 return (
                   <TouchableOpacity
@@ -720,7 +763,10 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
                     {/* 내용 */}
                     <View style={styles.noteContent}>
                       {isUnlocked ? (
-                        <Text style={styles.noteText} numberOfLines={3}>{memory.text}</Text>
+                        <>
+                          {memory.imageUri && <Image source={{ uri: memory.imageUri }} style={styles.noteImage} />}
+                          <Text style={styles.noteText} numberOfLines={memory.imageUri ? 2 : 3}>{memory.text}</Text>
+                        </>
                       ) : (
                         <Text style={styles.lockedText}>Visit to unlock!</Text>
                       )}
@@ -728,6 +774,7 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
 
                     {/* 거리 + author */}
                     <Text style={styles.distanceBadge}>📍 {formatDistance(distance)}</Text>
+                    <Text style={styles.radiusBadge}>알림 {getMemoryRadius(memory)}m</Text>
                     {!memory.isMine && (
                       <Text style={styles.authorBadge}>by {memory.author}</Text>
                     )}
@@ -768,7 +815,7 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
             {/* 메모리 마커들 */}
             {filteredMemories.map((memory) => {
               const distance = getDistanceFromLatLonInMeters(currentLat, currentLon, memory.latitude, memory.longitude);
-              const isUnlocked = distance < PROXIMITY_THRESHOLD;
+              const isUnlocked = distance < getMemoryRadius(memory);
               const markerStatus = getMarkerStatus(memory);
               const markerIcon = createCustomIcon(markerStatus);
 
@@ -915,6 +962,19 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
               autoFocus
             />
 
+            {selectedImageUri ? (
+              <View style={styles.imagePreviewContainer}>
+                <Image source={{ uri: selectedImageUri }} style={styles.imagePreview} />
+                <TouchableOpacity style={styles.removeImageButton} onPress={() => setSelectedImageUri(undefined)}>
+                  <Text style={styles.removeImageButtonText}>사진 삭제</Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
+              <TouchableOpacity style={styles.attachImageButton} onPress={handlePickImage}>
+                <Text style={styles.attachImageButtonText}>사진 1장 첨부</Text>
+              </TouchableOpacity>
+            )}
+
             {/* Visibility 토글 */}
             <View style={styles.visibilityToggle}>
               <TouchableOpacity
@@ -954,6 +1014,23 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
                 </View>
               </View>
             )}
+
+            <View style={styles.radiusSection}>
+              <Text style={styles.radiusLabel}>도착 알림 반경</Text>
+              <View style={styles.radiusButtons}>
+                {GEOFENCE_RADIUS_OPTIONS.map(radius => (
+                  <TouchableOpacity
+                    key={radius}
+                    style={[styles.radiusButton, selectedRadius === radius && styles.radiusButtonActive]}
+                    onPress={() => setSelectedRadius(radius)}
+                  >
+                    <Text style={[styles.radiusButtonText, selectedRadius === radius && styles.radiusButtonTextActive]}>
+                      {radius}m
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </View>
 
             {/* 중요 표시 토글 */}
             <TouchableOpacity 
@@ -1023,13 +1100,18 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
               
               {(() => {
                 const distance = getDistanceFromLatLonInMeters(currentLat, currentLon, selectedMemory.latitude, selectedMemory.longitude);
-                const isUnlocked = distance < PROXIMITY_THRESHOLD;
+                const isUnlocked = distance < getMemoryRadius(selectedMemory);
                 
                 return (
                   <>
                     <View style={styles.modalContent}>
                       {isUnlocked ? (
-                        <Text style={styles.modalText}>{selectedMemory.text}</Text>
+                        <>
+                          {selectedMemory.imageUri && (
+                            <Image source={{ uri: selectedMemory.imageUri }} style={styles.modalImage} />
+                          )}
+                          <Text style={styles.modalText}>{selectedMemory.text}</Text>
+                        </>
                       ) : (
                         <>
                           <Text style={styles.modalLockedIcon}>🔒</Text>
@@ -1052,6 +1134,7 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
                           ⏳ {formatRemainingTime(selectedMemory.expiresAt)}
                         </Text>
                       )}
+                      <Text style={styles.modalTimerText}>알림 {getMemoryRadius(selectedMemory)}m</Text>
                     </View>
                   </>
                 );
@@ -1369,6 +1452,12 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     lineHeight: 20,
   },
+  noteImage: {
+    width: '100%',
+    height: 62,
+    borderRadius: 3,
+    marginBottom: 4,
+  },
   lockedText: {
     fontSize: 13,
     fontFamily: 'NanumPenScript_400Regular',
@@ -1439,6 +1528,12 @@ const styles = StyleSheet.create({
     top: -12,
     alignSelf: 'center',
   },
+  radiusBadge: {
+    marginTop: 3,
+    color: '#5a5230',
+    fontSize: 9,
+    textAlign: 'center',
+  },
   modalPin: {
     fontSize: 28,
   },
@@ -1461,6 +1556,44 @@ const styles = StyleSheet.create({
     textAlignVertical: 'top',
     borderWidth: 1,
     borderColor: '#E8DFA3',
+  },
+  attachImageButton: {
+    marginTop: 10,
+    minHeight: 42,
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    borderColor: '#8B4513',
+    borderRadius: 4,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255,255,255,0.45)',
+  },
+  attachImageButtonText: {
+    color: '#5a5230',
+    fontSize: 16,
+    fontFamily: 'NanumPenScript_400Regular',
+  },
+  imagePreviewContainer: {
+    marginTop: 10,
+  },
+  imagePreview: {
+    width: '100%',
+    height: 120,
+    borderRadius: 4,
+  },
+  removeImageButton: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 4,
+  },
+  removeImageButtonText: {
+    color: '#FFF',
+    fontSize: 12,
+    fontWeight: '700',
   },
   // Visibility 토글
   visibilityToggle: {
@@ -1524,6 +1657,42 @@ const styles = StyleSheet.create({
     color: '#5a5230',
   },
   durationBtnTextActive: {
+    color: '#FFF',
+  },
+  radiusSection: {
+    marginTop: 12,
+  },
+  radiusLabel: {
+    marginBottom: 6,
+    color: '#5a5230',
+    fontSize: 15,
+    fontFamily: 'NanumPenScript_400Regular',
+    textAlign: 'center',
+  },
+  radiusButtons: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  radiusButton: {
+    flex: 1,
+    minHeight: 38,
+    borderWidth: 1,
+    borderColor: '#DEB887',
+    borderRadius: 4,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255,255,255,0.5)',
+  },
+  radiusButtonActive: {
+    backgroundColor: '#E67E22',
+    borderColor: '#E67E22',
+  },
+  radiusButtonText: {
+    color: '#5a5230',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  radiusButtonTextActive: {
     color: '#FFF',
   },
   // 중요 표시 토글
@@ -1621,6 +1790,12 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     marginTop: 16,
+  },
+  modalImage: {
+    width: '100%',
+    height: 150,
+    borderRadius: 4,
+    marginBottom: 12,
   },
   modalText: {
     fontSize: 22,

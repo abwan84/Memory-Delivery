@@ -43,6 +43,12 @@
     "plugins": [
       "expo-font",
       [
+        "expo-image-picker",
+        {
+          "photosPermission": "Memory Delivery needs photo access so you can attach one photo to a location memo."
+        }
+      ],
+      [
         "expo-location",
         {
           "locationAlwaysAndWhenInUsePermission": "Memory Delivery needs your location even when the app is closed to notify you when you're near a saved memory.",

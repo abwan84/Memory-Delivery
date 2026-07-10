@@ -1,7 +1,9 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { StyleSheet, View, Text, TouchableOpacity, TextInput, ScrollView, Platform, Alert, Dimensions, ActivityIndicator, ImageBackground } from 'react-native';
+import { StyleSheet, View, Text, TouchableOpacity, TextInput, ScrollView, Platform, Alert, Dimensions, ActivityIndicator, ImageBackground, Image } from 'react-native';
 import MapView, { Region, Marker } from 'react-native-maps';
 import * as Location from 'expo-location';
+import * as ImagePicker from 'expo-image-picker';
+import * as FileSystem from 'expo-file-system/legacy';
 import { LocationObject } from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFonts, NanumPenScript_400Regular } from '@expo-google-fonts/nanum-pen-script';
@@ -10,7 +12,9 @@ import { useFonts, NanumPenScript_400Regular } from '@expo-google-fonts/nanum-pe
 import { 
   registerGeofenceForMemory, 
   unregisterGeofenceForMemory,
-  GEOFENCE_RADIUS 
+  GEOFENCE_RADIUS,
+  GEOFENCE_RADIUS_OPTIONS,
+  GeofenceRadius,
 } from '../services/GeofencingService';
 
 // 코르크보드 배경 이미지
@@ -54,6 +58,8 @@ interface Memory {
   color: string;
   rotation: number;
   isImportant: boolean;
+  notificationRadius?: GeofenceRadius;
+  imageUri?: string;
   visibility: MemoryVisibility;
   duration?: number; // hours
   expiresAt?: number; // timestamp (ms)
@@ -151,8 +157,27 @@ async function cleanupExpiredMemories(storageKey: string): Promise<Memory[]> {
 }
 
 const STORAGE_KEY = '@memories';
-const PROXIMITY_THRESHOLD = 50;
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
+
+function getMemoryRadius(memory: Memory): GeofenceRadius {
+  return GEOFENCE_RADIUS_OPTIONS.includes(memory.notificationRadius as GeofenceRadius)
+    ? memory.notificationRadius as GeofenceRadius
+    : GEOFENCE_RADIUS;
+}
+
+async function persistMemoryImage(imageUri: string | undefined, memoryId: string): Promise<string | undefined> {
+  if (!imageUri || !FileSystem.documentDirectory) return imageUri;
+
+  const imageDirectory = `${FileSystem.documentDirectory}memory-images/`;
+  const uriWithoutQuery = imageUri.split('?')[0];
+  const extensionMatch = uriWithoutQuery.match(/\.([a-zA-Z0-9]+)$/);
+  const extension = extensionMatch?.[1]?.toLowerCase() || 'jpg';
+  const destination = `${imageDirectory}${memoryId}.${extension}`;
+
+  await FileSystem.makeDirectoryAsync(imageDirectory, { intermediates: true });
+  await FileSystem.copyAsync({ from: imageUri, to: destination });
+  return destination;
+}
 
 // Haversine 공식
 function getDistanceFromLatLonInMeters(
@@ -197,6 +222,8 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
   });
 
   const [memoryText, setMemoryText] = useState('');
+  const [selectedImageUri, setSelectedImageUri] = useState<string | undefined>();
+  const [selectedRadius, setSelectedRadius] = useState<GeofenceRadius>(GEOFENCE_RADIUS);
   const [memories, setMemories] = useState<Memory[]>([]);
   const [saveMessage, setSaveMessage] = useState('');
   const [isSaving, setIsSaving] = useState(false);
@@ -239,7 +266,7 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
         memory.longitude
       );
 
-      if (distance < PROXIMITY_THRESHOLD && !alertedMemoriesRef.current.has(memory.id)) {
+      if (distance < getMemoryRadius(memory) && !alertedMemoriesRef.current.has(memory.id)) {
         Alert.alert(
           '🎉 Memory Found!',
           `"${memory.text}"\n\nSaved on: ${memory.date}`,
@@ -247,6 +274,8 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
         );
         alertedMemoriesRef.current.add(memory.id);
         debugLog('MapScreen.tsx:geofence', 'Memory unlocked!', { memoryId: memory.id, distance }, 'A');
+      } else if (distance >= getMemoryRadius(memory)) {
+        alertedMemoriesRef.current.delete(memory.id);
       }
     });
   }, [location, memories, simulatedOffset]);
@@ -260,6 +289,7 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
         color: m.color || getRandomColor(),
         rotation: m.rotation !== undefined ? m.rotation : getRandomRotation(),
         isImportant: m.isImportant ?? false,
+        notificationRadius: getMemoryRadius(m),
         visibility: m.visibility ?? 'private',
         author: m.author ?? 'Me',
         isMine: m.isMine ?? true,
@@ -292,8 +322,10 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
       }
 
       const isPublic = selectedVisibility === 'public';
+      const memoryId = Date.now().toString();
+      const persistentImageUri = await persistMemoryImage(selectedImageUri, memoryId);
       const newMemory: Memory = {
-        id: Date.now().toString(),
+        id: memoryId,
         text: memoryText.trim(),
         latitude: freshLocation.coords.latitude,
         longitude: freshLocation.coords.longitude,
@@ -301,6 +333,8 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
         color: getRandomColor(),
         rotation: getRandomRotation(),
         isImportant: false,
+        notificationRadius: selectedRadius,
+        imageUri: persistentImageUri,
         visibility: selectedVisibility,
         duration: isPublic ? selectedDuration : undefined,
         expiresAt: isPublic ? Date.now() + selectedDuration * 60 * 60 * 1000 : undefined,
@@ -312,6 +346,8 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
       await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(updatedMemories));
       setMemories(updatedMemories);
       setMemoryText('');
+      setSelectedImageUri(undefined);
+      setSelectedRadius(GEOFENCE_RADIUS);
       setSelectedVisibility('private');
       setSelectedDuration(24);
       
@@ -319,7 +355,7 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
       if (backgroundPermissionGranted) {
         await registerGeofenceForMemory(newMemory);
         showMessage('✨ Memory Saved! (알림 활성화)');
-        console.log(`📍 [MapScreen] Geofence registered for memory ${newMemory.id} at radius ${GEOFENCE_RADIUS}m`);
+        console.log(`📍 [MapScreen] Geofence registered for memory ${newMemory.id} at radius ${newMemory.notificationRadius}m`);
       } else {
         showMessage('✨ Memory Saved!');
       }
@@ -336,6 +372,63 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
   const showMessage = (message: string) => {
     setSaveMessage(message);
     setTimeout(() => setSaveMessage(''), 3000);
+  };
+
+  const handlePickImage = async () => {
+    if (Platform.OS !== 'web') {
+      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!permission.granted) {
+        Alert.alert('사진 권한 필요', '메모에 사진을 첨부하려면 사진 접근 권한이 필요합니다.');
+        return;
+      }
+    }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['images'],
+      allowsEditing: true,
+      aspect: [4, 3],
+      quality: 0.8,
+    });
+
+    if (!result.canceled && result.assets[0]) {
+      setSelectedImageUri(result.assets[0].uri);
+    }
+  };
+
+  const handleToggleImportant = async (memoryId: string) => {
+    const updatedMemories = memories.map(memory =>
+      memory.id === memoryId ? { ...memory, isImportant: !memory.isImportant } : memory
+    );
+    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(updatedMemories));
+    setMemories(updatedMemories);
+  };
+
+  const deleteMemory = async (memoryId: string) => {
+    const memoryToDelete = memories.find(memory => memory.id === memoryId);
+    const updatedMemories = memories.filter(memory => memory.id !== memoryId);
+    await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(updatedMemories));
+    setMemories(updatedMemories);
+    alertedMemoriesRef.current.delete(memoryId);
+    await unregisterGeofenceForMemory(memoryId);
+
+    if (FileSystem.documentDirectory && memoryToDelete?.imageUri?.startsWith(FileSystem.documentDirectory)) {
+      await FileSystem.deleteAsync(memoryToDelete.imageUri, { idempotent: true });
+    }
+  };
+
+  const handleDeleteMemory = (memoryId: string) => {
+    Alert.alert('메모 삭제', '이 위치 메모를 삭제할까요?', [
+      { text: '취소', style: 'cancel' },
+      {
+        text: '삭제',
+        style: 'destructive',
+        onPress: () => {
+          deleteMemory(memoryId).catch(() => {
+            Alert.alert('삭제 실패', '메모를 삭제하지 못했습니다. 다시 시도해주세요.');
+          });
+        },
+      },
+    ]);
   };
 
   const handleTeleport = () => {
@@ -434,7 +527,7 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
               memory.latitude,
               memory.longitude
             );
-            const isUnlocked = distance < PROXIMITY_THRESHOLD;
+            const isUnlocked = distance < getMemoryRadius(memory);
             const isOthers = !memory.isMine;
             const timerLabel = memory.visibility === 'public' && memory.expiresAt ? ` ⏳${formatRemainingTime(memory.expiresAt)}` : '';
             const authorLabel = isOthers ? ` by ${memory.author}` : '';
@@ -483,6 +576,19 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
             numberOfLines={2}
           />
 
+          {selectedImageUri ? (
+            <View style={styles.imagePreviewContainer}>
+              <Image source={{ uri: selectedImageUri }} style={styles.imagePreview} />
+              <TouchableOpacity style={styles.removeImageButton} onPress={() => setSelectedImageUri(undefined)}>
+                <Text style={styles.removeImageButtonText}>사진 삭제</Text>
+              </TouchableOpacity>
+            </View>
+          ) : (
+            <TouchableOpacity style={styles.attachImageButton} onPress={handlePickImage}>
+              <Text style={styles.attachImageButtonText}>사진 1장 첨부</Text>
+            </TouchableOpacity>
+          )}
+
           {/* Visibility 토글 */}
           <View style={styles.visibilityToggle}>
             <TouchableOpacity
@@ -522,6 +628,23 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
               </View>
             </View>
           )}
+
+          <View style={styles.radiusSection}>
+            <Text style={styles.radiusLabel}>도착 알림 반경</Text>
+            <View style={styles.radiusButtons}>
+              {GEOFENCE_RADIUS_OPTIONS.map(radius => (
+                <TouchableOpacity
+                  key={radius}
+                  style={[styles.radiusButton, selectedRadius === radius && styles.radiusButtonActive]}
+                  onPress={() => setSelectedRadius(radius)}
+                >
+                  <Text style={[styles.radiusButtonText, selectedRadius === radius && styles.radiusButtonTextActive]}>
+                    {radius}m
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </View>
 
           <TouchableOpacity 
             style={[styles.saveButton, isSaving && styles.saveButtonDisabled]} 
@@ -571,7 +694,7 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
                   memory.latitude,
                   memory.longitude
                 );
-                const isUnlocked = distance < PROXIMITY_THRESHOLD;
+                const isUnlocked = distance < getMemoryRadius(memory);
                 const isPublic = memory.visibility === 'public';
 
                 return (
@@ -587,8 +710,19 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
                     ]}
                   >
                     <View style={styles.pinContainer}>
-                      <Text style={styles.pinIcon}>📌</Text>
+                      <Text style={styles.pinIcon}>{memory.isImportant ? '📍' : '📌'}</Text>
                     </View>
+
+                    {memory.isMine && (
+                      <View style={styles.noteActions}>
+                        <TouchableOpacity style={styles.noteActionButton} onPress={() => handleToggleImportant(memory.id)}>
+                          <Text style={styles.noteActionText}>{memory.isImportant ? '★' : '☆'}</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity style={styles.noteActionButton} onPress={() => handleDeleteMemory(memory.id)}>
+                          <Text style={styles.noteActionText}>×</Text>
+                        </TouchableOpacity>
+                      </View>
+                    )}
 
                     {/* Visibility 뱃지 */}
                     <View style={[styles.visibilityBadge, isPublic ? styles.visibilityBadgePublic : styles.visibilityBadgePrivate]}>
@@ -614,9 +748,12 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
 
                     <View style={styles.noteContent}>
                       {isUnlocked ? (
-                        <Text style={styles.noteText} numberOfLines={3}>
-                          {memory.text}
-                        </Text>
+                        <>
+                          {memory.imageUri && <Image source={{ uri: memory.imageUri }} style={styles.noteImage} />}
+                          <Text style={styles.noteText} numberOfLines={memory.imageUri ? 2 : 3}>
+                            {memory.text}
+                          </Text>
+                        </>
                       ) : (
                         <Text style={styles.lockedText}>Visit to unlock!</Text>
                       )}
@@ -624,6 +761,7 @@ export default function MapScreen({ location, backgroundPermissionGranted }: Map
 
                     <View style={styles.noteFooter}>
                       <Text style={styles.distanceBadge}>📍 {formatDistance(distance)}</Text>
+                      <Text style={styles.radiusBadge}>알림 {getMemoryRadius(memory)}m</Text>
                       {!memory.isMine && (
                         <Text style={styles.authorBadge}>by {memory.author}</Text>
                       )}
@@ -809,6 +947,44 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#E8DFA3',
   },
+  attachImageButton: {
+    marginTop: 10,
+    minHeight: 42,
+    borderWidth: 1,
+    borderStyle: 'dashed',
+    borderColor: '#8B4513',
+    borderRadius: 4,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255,255,255,0.45)',
+  },
+  attachImageButtonText: {
+    color: '#5D3A1A',
+    fontSize: 16,
+    fontFamily: 'NanumPenScript_400Regular',
+  },
+  imagePreviewContainer: {
+    marginTop: 10,
+  },
+  imagePreview: {
+    width: '100%',
+    height: 140,
+    borderRadius: 4,
+  },
+  removeImageButton: {
+    position: 'absolute',
+    top: 8,
+    right: 8,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderRadius: 4,
+  },
+  removeImageButtonText: {
+    color: '#FFF',
+    fontSize: 12,
+    fontWeight: '700',
+  },
   saveButton: {
     backgroundColor: '#E67E22',
     paddingVertical: 12,
@@ -906,6 +1082,42 @@ const styles = StyleSheet.create({
   durationBtnTextActive: {
     color: '#FFF',
   },
+  radiusSection: {
+    marginTop: 12,
+  },
+  radiusLabel: {
+    marginBottom: 6,
+    color: '#5D3A1A',
+    fontSize: 15,
+    fontFamily: 'NanumPenScript_400Regular',
+    textAlign: 'center',
+  },
+  radiusButtons: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  radiusButton: {
+    flex: 1,
+    minHeight: 38,
+    borderWidth: 1,
+    borderColor: '#DEB887',
+    borderRadius: 4,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255,255,255,0.5)',
+  },
+  radiusButtonActive: {
+    backgroundColor: '#E67E22',
+    borderColor: '#E67E22',
+  },
+  radiusButtonText: {
+    color: '#5D3A1A',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  radiusButtonTextActive: {
+    color: '#FFF',
+  },
   // 코르크보드
   corkboard: {
     flex: 1,
@@ -961,6 +1173,27 @@ const styles = StyleSheet.create({
   pinIcon: {
     fontSize: 16,
   },
+  noteActions: {
+    position: 'absolute',
+    top: 4,
+    right: 4,
+    zIndex: 12,
+    flexDirection: 'row',
+    gap: 4,
+  },
+  noteActionButton: {
+    width: 28,
+    height: 28,
+    borderRadius: 4,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255,255,255,0.82)',
+  },
+  noteActionText: {
+    color: '#5D3A1A',
+    fontSize: 18,
+    fontWeight: '700',
+  },
   stickyNotePublic: {
     borderLeftWidth: 3,
     borderLeftColor: '#3498db',
@@ -1004,7 +1237,7 @@ const styles = StyleSheet.create({
   },
   lockSticker: {
     position: 'absolute',
-    top: 6,
+    top: 38,
     right: 6,
     backgroundColor: '#FF6B6B',
     width: 28,
@@ -1028,6 +1261,12 @@ const styles = StyleSheet.create({
     color: '#333',
     lineHeight: 22,
   },
+  noteImage: {
+    width: '100%',
+    height: 58,
+    borderRadius: 3,
+    marginBottom: 4,
+  },
   lockedText: {
     fontSize: 14,
     fontFamily: 'NanumPenScript_400Regular',
@@ -1046,6 +1285,11 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     alignSelf: 'flex-start',
     overflow: 'hidden',
+  },
+  radiusBadge: {
+    marginTop: 3,
+    fontSize: 9,
+    color: '#5D3A1A',
   },
   authorBadge: {
     fontSize: 9,

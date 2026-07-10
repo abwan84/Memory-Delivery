@@ -10,6 +10,8 @@ import { Platform } from 'react-native';
 export const GEOFENCING_TASK = 'MEMORY_GEOFENCING_TASK';
 export const STORAGE_KEY = '@memories';
 export const GEOFENCE_RADIUS = 100; // meters
+export const GEOFENCE_RADIUS_OPTIONS = [50, 100, 200] as const;
+export type GeofenceRadius = typeof GEOFENCE_RADIUS_OPTIONS[number];
 
 // Memory 타입 정의
 interface Memory {
@@ -21,6 +23,13 @@ interface Memory {
   color: string;
   rotation: number;
   isImportant: boolean;
+  notificationRadius?: GeofenceRadius;
+}
+
+function getMemoryRadius(memory: Memory): GeofenceRadius {
+  return GEOFENCE_RADIUS_OPTIONS.includes(memory.notificationRadius as GeofenceRadius)
+    ? memory.notificationRadius as GeofenceRadius
+    : GEOFENCE_RADIUS;
 }
 
 // 알림된 메모리 추적 (중복 알림 방지)
@@ -62,13 +71,19 @@ TaskManager.defineTask(GEOFENCING_TASK, async ({ data, error }) => {
     // 지오펜스 진입 감지
     if (eventType === Location.GeofencingEventType.Enter) {
       console.log('🔔 [GeofencingTask] ENTERED region:', region.identifier);
+      const regionId = region.identifier;
+
+      if (!regionId) {
+        console.warn('🔔 [GeofencingTask] Region identifier is missing');
+        return;
+      }
       
       try {
         // 이미 알림된 메모리인지 확인
         const notifiedStr = await AsyncStorage.getItem(NOTIFIED_MEMORIES_KEY);
         const notifiedMemories: string[] = notifiedStr ? JSON.parse(notifiedStr) : [];
         
-        if (notifiedMemories.includes(region.identifier)) {
+        if (notifiedMemories.includes(regionId)) {
           console.log('🔔 [GeofencingTask] Already notified for this memory, skipping...');
           return;
         }
@@ -77,7 +92,7 @@ TaskManager.defineTask(GEOFENCING_TASK, async ({ data, error }) => {
         const memoriesStr = await AsyncStorage.getItem(STORAGE_KEY);
         if (memoriesStr) {
           const memories: Memory[] = JSON.parse(memoriesStr);
-          const memory = memories.find(m => m.id === region.identifier);
+          const memory = memories.find(m => m.id === regionId);
           
           if (memory) {
             // 알림 표시
@@ -94,7 +109,7 @@ TaskManager.defineTask(GEOFENCING_TASK, async ({ data, error }) => {
             console.log('🔔 [GeofencingTask] Notification sent for memory:', memory.id);
             
             // 알림된 메모리로 기록 (24시간 후 초기화 가능하도록)
-            notifiedMemories.push(region.identifier);
+            notifiedMemories.push(regionId);
             await AsyncStorage.setItem(NOTIFIED_MEMORIES_KEY, JSON.stringify(notifiedMemories));
           }
         }
@@ -106,6 +121,18 @@ TaskManager.defineTask(GEOFENCING_TASK, async ({ data, error }) => {
     // 지오펜스 이탈 감지 (선택적 로깅)
     if (eventType === Location.GeofencingEventType.Exit) {
       console.log('🔔 [GeofencingTask] EXITED region:', region.identifier);
+      const regionId = region.identifier;
+
+      if (regionId) {
+        try {
+          const notifiedStr = await AsyncStorage.getItem(NOTIFIED_MEMORIES_KEY);
+          const notifiedMemories: string[] = notifiedStr ? JSON.parse(notifiedStr) : [];
+          const remainingMemories = notifiedMemories.filter(id => id !== regionId);
+          await AsyncStorage.setItem(NOTIFIED_MEMORIES_KEY, JSON.stringify(remainingMemories));
+        } catch (err) {
+          console.error('🔔 [GeofencingTask] Error resetting notification state:', err);
+        }
+      }
     }
   }
 });
@@ -213,9 +240,9 @@ export async function registerGeofenceForMemory(memory: Memory): Promise<void> {
       identifier: memory.id,
       latitude: memory.latitude,
       longitude: memory.longitude,
-      radius: GEOFENCE_RADIUS,
+      radius: getMemoryRadius(memory),
       notifyOnEnter: true,
-      notifyOnExit: false,
+      notifyOnExit: true,
     }];
 
     // 기존 지오펜스에 추가
@@ -273,9 +300,9 @@ export async function registerAllGeofences(): Promise<void> {
       identifier: memory.id,
       latitude: memory.latitude,
       longitude: memory.longitude,
-      radius: GEOFENCE_RADIUS,
+      radius: getMemoryRadius(memory),
       notifyOnEnter: true,
-      notifyOnExit: false,
+      notifyOnExit: true,
     }));
 
     // 지오펜싱 시작
@@ -344,9 +371,9 @@ async function getRegisteredGeofences(): Promise<Location.LocationRegion[]> {
       identifier: memory.id,
       latitude: memory.latitude,
       longitude: memory.longitude,
-      radius: GEOFENCE_RADIUS,
+      radius: getMemoryRadius(memory),
       notifyOnEnter: true,
-      notifyOnExit: false,
+      notifyOnExit: true,
     }));
   } catch {
     return [];
