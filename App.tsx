@@ -16,12 +16,6 @@ import {
   getGeofencingStatus 
 } from './services/GeofencingService';
 
-// #region agent log
-const debugLog = (location: string, message: string, data: object, hypothesisId: string) => {
-  fetch('http://127.0.0.1:7242/ingest/0595a1ca-db13-40a1-91db-65b59f7fff34',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({location,message,data,timestamp:Date.now(),sessionId:'debug-session',hypothesisId})}).catch(()=>{});
-};
-// #endregion
-
 type AppState = 'loading' | 'granted' | 'denied';
 
 const isExpoGo = Constants.executionEnvironment === ExecutionEnvironment.StoreClient;
@@ -31,23 +25,15 @@ export default function App() {
   const [location, setLocation] = useState<LocationObject | null>(null);
   const [backgroundPermissionGranted, setBackgroundPermissionGranted] = useState(false);
 
-  // #region agent log
-  useEffect(() => {
-    debugLog('App.tsx:init', 'App component mounted', { appState }, 'D');
-  }, []);
-  // #endregion
-
   /**
    * 위치 권한 요청 (Foreground + Background)
    */
   const requestLocationPermission = async () => {
-    debugLog('App.tsx:requestLocationPermission', 'Starting permission request', {}, 'C');
     setAppState('loading');
     
     try {
       // 1. Foreground 위치 권한 요청
       const { status: foregroundStatus } = await Location.requestForegroundPermissionsAsync();
-      debugLog('App.tsx:permissionResult', 'Foreground permission result', { foregroundStatus }, 'C');
       
       if (foregroundStatus !== 'granted') {
         setAppState('denied');
@@ -58,11 +44,6 @@ export default function App() {
       const currentLocation = await Location.getCurrentPositionAsync({
         accuracy: Location.Accuracy.Balanced,
       });
-      debugLog('App.tsx:locationResult', 'Location received', { 
-        lat: currentLocation.coords.latitude, 
-        lng: currentLocation.coords.longitude 
-      }, 'E');
-      
       setLocation(currentLocation);
       setAppState('granted');
 
@@ -75,7 +56,6 @@ export default function App() {
       }
 
     } catch (error) {
-      debugLog('App.tsx:error', 'Error in requestLocationPermission', { error: String(error) }, 'C');
       console.error('Error getting location:', error);
       setAppState('denied');
     }

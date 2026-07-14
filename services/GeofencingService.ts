@@ -12,10 +12,23 @@ export const STORAGE_KEY = '@memories';
 export const GEOFENCE_RADIUS = 100; // meters
 export const GEOFENCE_RADIUS_OPTIONS = [50, 100, 200] as const;
 export type GeofenceRadius = typeof GEOFENCE_RADIUS_OPTIONS[number];
+export const REENTRY_BUFFER_METERS = 50;
+export type NotificationRepeatMode = 'repeat' | 'once';
+export const DEFAULT_NOTIFICATION_REPEAT_MODE: NotificationRepeatMode = 'repeat';
 const ARRIVAL_NOTIFICATION_CHANNEL = 'memory-arrivals';
+const LEGACY_NOTIFIED_MEMORIES_KEY = '@notified_memories';
+const ARRIVAL_NOTIFICATION_STATES_KEY = '@arrival_notification_states_v2';
+
+type ArrivalNotificationState = {
+  status: 'cooldown' | 'completed';
+  hasDelivered: boolean;
+};
+
+type ArrivalNotificationStates = Record<string, ArrivalNotificationState>;
+let arrivalStateQueue: Promise<void> = Promise.resolve();
 
 // Memory 타입 정의
-interface Memory {
+export interface GeofencedMemory {
   id: string;
   text: string;
   latitude: number;
@@ -25,15 +38,237 @@ interface Memory {
   rotation: number;
   isImportant: boolean;
   notificationRadius?: GeofenceRadius;
+  notificationRepeatMode?: NotificationRepeatMode;
+  arrivalNotificationEnabled?: boolean;
 }
 
-function getMemoryRadius(memory: Memory): GeofenceRadius {
+function getMemoryRadius(memory: GeofencedMemory): GeofenceRadius {
   return GEOFENCE_RADIUS_OPTIONS.includes(memory.notificationRadius as GeofenceRadius)
     ? memory.notificationRadius as GeofenceRadius
     : GEOFENCE_RADIUS;
 }
 
-export async function sendArrivalNotification(memory: Memory): Promise<void> {
+export function getNotificationRepeatMode(memory: GeofencedMemory): NotificationRepeatMode {
+  return memory.notificationRepeatMode === 'once'
+    ? 'once'
+    : DEFAULT_NOTIFICATION_REPEAT_MODE;
+}
+
+export function isArrivalNotificationEnabled(memory: GeofencedMemory): boolean {
+  return memory.arrivalNotificationEnabled !== false;
+}
+
+function getReentryRadius(memory: GeofencedMemory): number {
+  return getMemoryRadius(memory) + REENTRY_BUFFER_METERS;
+}
+
+async function writeArrivalNotificationStates(states: ArrivalNotificationStates): Promise<void> {
+  await AsyncStorage.setItem(ARRIVAL_NOTIFICATION_STATES_KEY, JSON.stringify(states));
+}
+
+async function readArrivalNotificationStates(): Promise<ArrivalNotificationStates> {
+  const stored = await AsyncStorage.getItem(ARRIVAL_NOTIFICATION_STATES_KEY);
+  if (stored) {
+    try {
+      return JSON.parse(stored) as ArrivalNotificationStates;
+    } catch {
+      await AsyncStorage.removeItem(ARRIVAL_NOTIFICATION_STATES_KEY);
+    }
+  }
+
+  const legacyStored = await AsyncStorage.getItem(LEGACY_NOTIFIED_MEMORIES_KEY);
+  if (!legacyStored) return {};
+
+  try {
+    const legacyIds = JSON.parse(legacyStored) as string[];
+    const migrated = legacyIds.reduce<ArrivalNotificationStates>((states, memoryId) => {
+      states[memoryId] = { status: 'cooldown', hasDelivered: true };
+      return states;
+    }, {});
+    await writeArrivalNotificationStates(migrated);
+    await AsyncStorage.removeItem(LEGACY_NOTIFIED_MEMORIES_KEY);
+    return migrated;
+  } catch {
+    await AsyncStorage.removeItem(LEGACY_NOTIFIED_MEMORIES_KEY);
+    return {};
+  }
+}
+
+function buildRegion(
+  memory: GeofencedMemory,
+  states: ArrivalNotificationStates
+): Location.LocationRegion {
+  const state = states[memory.id];
+  const isWaitingForExit = state?.status === 'cooldown';
+
+  return {
+    identifier: memory.id,
+    latitude: memory.latitude,
+    longitude: memory.longitude,
+    radius: isWaitingForExit ? getReentryRadius(memory) : getMemoryRadius(memory),
+    notifyOnEnter: state?.status !== 'completed',
+    notifyOnExit: isWaitingForExit,
+  };
+}
+
+function buildRegions(
+  memories: GeofencedMemory[],
+  states: ArrivalNotificationStates
+): Location.LocationRegion[] {
+  return memories
+    .filter(memory =>
+      isArrivalNotificationEnabled(memory) &&
+      states[memory.id]?.status !== 'completed'
+    )
+    .map(memory => buildRegion(memory, states));
+}
+
+async function replaceRegisteredGeofences(
+  memories: GeofencedMemory[],
+  states: ArrivalNotificationStates
+): Promise<void> {
+  if (Platform.OS === 'web') return;
+
+  const regions = buildRegions(memories, states);
+  const hasStarted = await Location.hasStartedGeofencingAsync(GEOFENCING_TASK);
+
+  if (regions.length === 0) {
+    if (hasStarted) await Location.stopGeofencingAsync(GEOFENCING_TASK);
+    return;
+  }
+
+  await Location.startGeofencingAsync(GEOFENCING_TASK, regions);
+}
+
+function getDistanceInMeters(
+  latitudeA: number,
+  longitudeA: number,
+  latitudeB: number,
+  longitudeB: number
+): number {
+  const earthRadius = 6371000;
+  const toRadians = (degrees: number) => degrees * (Math.PI / 180);
+  const latitudeDelta = toRadians(latitudeB - latitudeA);
+  const longitudeDelta = toRadians(longitudeB - longitudeA);
+  const startLatitude = toRadians(latitudeA);
+  const endLatitude = toRadians(latitudeB);
+  const haversine =
+    Math.sin(latitudeDelta / 2) ** 2 +
+    Math.cos(startLatitude) * Math.cos(endLatitude) * Math.sin(longitudeDelta / 2) ** 2;
+
+  return earthRadius * 2 * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine));
+}
+
+function runArrivalStateOperation<T>(operation: () => Promise<T>): Promise<T> {
+  const result = arrivalStateQueue.then(operation, operation);
+  arrivalStateQueue = result.then(() => undefined, () => undefined);
+  return result;
+}
+
+async function refreshGeofencesIfRunning(
+  memories: GeofencedMemory[],
+  states: ArrivalNotificationStates
+): Promise<void> {
+  if (Platform.OS === 'web') return;
+  const hasStarted = await Location.hasStartedGeofencingAsync(GEOFENCING_TASK).catch(() => false);
+  if (hasStarted) await replaceRegisteredGeofences(memories, states);
+}
+
+export async function prepareMemoryNotificationState(
+  memory: GeofencedMemory,
+  currentDistance: number
+): Promise<void> {
+  await runArrivalStateOperation(async () => {
+    const states = await readArrivalNotificationStates();
+
+    if (!isArrivalNotificationEnabled(memory)) {
+      if (states[memory.id]) {
+        delete states[memory.id];
+        await writeArrivalNotificationStates(states);
+      }
+      return;
+    }
+
+    const existing = states[memory.id];
+    const repeatMode = getNotificationRepeatMode(memory);
+
+    if (repeatMode === 'once' && existing?.hasDelivered) {
+      states[memory.id] = { status: 'completed', hasDelivered: true };
+    } else if (repeatMode === 'repeat' && existing?.status === 'completed') {
+      states[memory.id] = { status: 'cooldown', hasDelivered: true };
+    } else if (currentDistance < getReentryRadius(memory) && !existing) {
+      states[memory.id] = { status: 'cooldown', hasDelivered: false };
+    } else if (currentDistance >= getReentryRadius(memory) && existing?.status === 'cooldown') {
+      delete states[memory.id];
+    }
+
+    await writeArrivalNotificationStates(states);
+  });
+}
+
+export async function claimForegroundArrivalNotifications(
+  memories: GeofencedMemory[],
+  currentLatitude: number,
+  currentLongitude: number
+): Promise<GeofencedMemory[]> {
+  return runArrivalStateOperation(async () => {
+    const states = await readArrivalNotificationStates();
+    const claimed: GeofencedMemory[] = [];
+    let changed = false;
+
+    for (const memory of memories) {
+      if (!isArrivalNotificationEnabled(memory)) {
+        if (states[memory.id]) {
+          delete states[memory.id];
+          changed = true;
+        }
+        continue;
+      }
+
+      const distance = getDistanceInMeters(
+        currentLatitude,
+        currentLongitude,
+        memory.latitude,
+        memory.longitude
+      );
+      const state = states[memory.id];
+
+      if (state?.status === 'cooldown' && distance >= getReentryRadius(memory)) {
+        delete states[memory.id];
+        changed = true;
+        continue;
+      }
+
+      if (!state && distance < getMemoryRadius(memory)) {
+        states[memory.id] = getNotificationRepeatMode(memory) === 'once'
+          ? { status: 'completed', hasDelivered: true }
+          : { status: 'cooldown', hasDelivered: true };
+        claimed.push(memory);
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      await writeArrivalNotificationStates(states);
+      await refreshGeofencesIfRunning(memories, states);
+    }
+
+    return claimed;
+  });
+}
+
+export async function removeMemoryNotificationState(memoryId: string): Promise<void> {
+  await runArrivalStateOperation(async () => {
+    const states = await readArrivalNotificationStates();
+    if (!states[memoryId]) return;
+    delete states[memoryId];
+    await writeArrivalNotificationStates(states);
+  });
+}
+
+export async function sendArrivalNotification(memory: GeofencedMemory): Promise<void> {
+  if (!isArrivalNotificationEnabled(memory)) return;
+
   await Notifications.scheduleNotificationAsync({
     content: {
       title: memory.isImportant ? '중요한 위치 메모에 도착했어요' : '위치 메모에 도착했어요',
@@ -48,8 +283,6 @@ export async function sendArrivalNotification(memory: Memory): Promise<void> {
 }
 
 // 알림된 메모리 추적 (중복 알림 방지)
-const NOTIFIED_MEMORIES_KEY = '@notified_memories';
-
 // ============================================
 // Notification Configuration
 // ============================================
@@ -95,10 +328,9 @@ TaskManager.defineTask(GEOFENCING_TASK, async ({ data, error }) => {
       
       try {
         // 이미 알림된 메모리인지 확인
-        const notifiedStr = await AsyncStorage.getItem(NOTIFIED_MEMORIES_KEY);
-        const notifiedMemories: string[] = notifiedStr ? JSON.parse(notifiedStr) : [];
+        const states = await readArrivalNotificationStates();
         
-        if (notifiedMemories.includes(regionId)) {
+        if (states[regionId]) {
           console.log('🔔 [GeofencingTask] Already notified for this memory, skipping...');
           return;
         }
@@ -106,18 +338,31 @@ TaskManager.defineTask(GEOFENCING_TASK, async ({ data, error }) => {
         // 메모리 정보 가져오기
         const memoriesStr = await AsyncStorage.getItem(STORAGE_KEY);
         if (memoriesStr) {
-          const memories: Memory[] = JSON.parse(memoriesStr);
+          const memories: GeofencedMemory[] = JSON.parse(memoriesStr);
           const memory = memories.find(m => m.id === regionId);
           
           if (memory) {
-            // 알림 표시
-            await sendArrivalNotification(memory);
+            if (!isArrivalNotificationEnabled(memory)) {
+              await replaceRegisteredGeofences(memories, states);
+              return;
+            }
+
+            states[regionId] = getNotificationRepeatMode(memory) === 'once'
+              ? { status: 'completed', hasDelivered: true }
+              : { status: 'cooldown', hasDelivered: true };
+            await writeArrivalNotificationStates(states);
+            try {
+              await sendArrivalNotification(memory);
+            } catch (notificationError) {
+              delete states[regionId];
+              await writeArrivalNotificationStates(states);
+              throw notificationError;
+            }
             
             console.log('🔔 [GeofencingTask] Notification sent for memory:', memory.id);
             
             // 알림된 메모리로 기록 (24시간 후 초기화 가능하도록)
-            notifiedMemories.push(regionId);
-            await AsyncStorage.setItem(NOTIFIED_MEMORIES_KEY, JSON.stringify(notifiedMemories));
+            await replaceRegisteredGeofences(memories, states);
           }
         }
       } catch (err) {
@@ -132,10 +377,15 @@ TaskManager.defineTask(GEOFENCING_TASK, async ({ data, error }) => {
 
       if (regionId) {
         try {
-          const notifiedStr = await AsyncStorage.getItem(NOTIFIED_MEMORIES_KEY);
-          const notifiedMemories: string[] = notifiedStr ? JSON.parse(notifiedStr) : [];
-          const remainingMemories = notifiedMemories.filter(id => id !== regionId);
-          await AsyncStorage.setItem(NOTIFIED_MEMORIES_KEY, JSON.stringify(remainingMemories));
+          const states = await readArrivalNotificationStates();
+          if (states[regionId]?.status !== 'cooldown') return;
+
+          delete states[regionId];
+          await writeArrivalNotificationStates(states);
+
+          const memoriesStr = await AsyncStorage.getItem(STORAGE_KEY);
+          const memories: GeofencedMemory[] = memoriesStr ? JSON.parse(memoriesStr) : [];
+          await replaceRegisteredGeofences(memories, states);
         } catch (err) {
           console.error('🔔 [GeofencingTask] Error resetting notification state:', err);
         }
@@ -238,7 +488,7 @@ export async function requestAllPermissions(): Promise<{
 /**
  * 단일 메모리에 대한 지오펜스 등록
  */
-export async function registerGeofenceForMemory(memory: Memory): Promise<void> {
+export async function registerGeofenceForMemory(memory: GeofencedMemory): Promise<void> {
   if (Platform.OS === 'web') {
     console.log('🌐 [Geofencing] Web platform - skipping geofence registration');
     return;
@@ -252,14 +502,8 @@ export async function registerGeofenceForMemory(memory: Memory): Promise<void> {
       return;
     }
 
-    const regions: Location.LocationRegion[] = [{
-      identifier: memory.id,
-      latitude: memory.latitude,
-      longitude: memory.longitude,
-      radius: getMemoryRadius(memory),
-      notifyOnEnter: true,
-      notifyOnExit: true,
-    }];
+    const states = await readArrivalNotificationStates();
+    const regions = buildRegions([memory], states);
 
     // 기존 지오펜스에 추가
     const hasStarted = await Location.hasStartedGeofencingAsync(GEOFENCING_TASK);
@@ -268,8 +512,12 @@ export async function registerGeofenceForMemory(memory: Memory): Promise<void> {
       // 기존 지오펜스 가져와서 새 것 추가
       const existingRegions = await getRegisteredGeofences();
       const allRegions = [...existingRegions.filter(r => r.identifier !== memory.id), ...regions];
-      await Location.startGeofencingAsync(GEOFENCING_TASK, allRegions);
-    } else {
+      if (allRegions.length === 0) {
+        await Location.stopGeofencingAsync(GEOFENCING_TASK);
+      } else {
+        await Location.startGeofencingAsync(GEOFENCING_TASK, allRegions);
+      }
+    } else if (regions.length > 0) {
       await Location.startGeofencingAsync(GEOFENCING_TASK, regions);
     }
 
@@ -305,24 +553,18 @@ export async function registerAllGeofences(): Promise<void> {
       return;
     }
 
-    const memories: Memory[] = JSON.parse(memoriesStr);
+    const memories: GeofencedMemory[] = JSON.parse(memoriesStr);
     if (memories.length === 0) {
       console.log('📭 [Geofencing] No memories to register');
       return;
     }
 
     // 지역 배열 생성
-    const regions: Location.LocationRegion[] = memories.map(memory => ({
-      identifier: memory.id,
-      latitude: memory.latitude,
-      longitude: memory.longitude,
-      radius: getMemoryRadius(memory),
-      notifyOnEnter: true,
-      notifyOnExit: true,
-    }));
+    const states = await readArrivalNotificationStates();
+    const regions = buildRegions(memories, states);
 
     // 지오펜싱 시작
-    await Location.startGeofencingAsync(GEOFENCING_TASK, regions);
+    await replaceRegisteredGeofences(memories, states);
     console.log(`✅ [Geofencing] Registered ${regions.length} geofences`);
     
   } catch (error) {
@@ -337,6 +579,7 @@ export async function unregisterGeofenceForMemory(memoryId: string): Promise<voi
   if (Platform.OS === 'web') return;
 
   try {
+    await removeMemoryNotificationState(memoryId);
     const hasStarted = await Location.hasStartedGeofencingAsync(GEOFENCING_TASK);
     if (!hasStarted) return;
 
@@ -382,15 +625,9 @@ async function getRegisteredGeofences(): Promise<Location.LocationRegion[]> {
     const memoriesStr = await AsyncStorage.getItem(STORAGE_KEY);
     if (!memoriesStr) return [];
 
-    const memories: Memory[] = JSON.parse(memoriesStr);
-    return memories.map(memory => ({
-      identifier: memory.id,
-      latitude: memory.latitude,
-      longitude: memory.longitude,
-      radius: getMemoryRadius(memory),
-      notifyOnEnter: true,
-      notifyOnExit: true,
-    }));
+    const memories: GeofencedMemory[] = JSON.parse(memoriesStr);
+    const states = await readArrivalNotificationStates();
+    return buildRegions(memories, states);
   } catch {
     return [];
   }
@@ -400,7 +637,10 @@ async function getRegisteredGeofences(): Promise<Location.LocationRegion[]> {
  * 알림된 메모리 기록 초기화 (디버깅/테스트용)
  */
 export async function clearNotifiedMemories(): Promise<void> {
-  await AsyncStorage.removeItem(NOTIFIED_MEMORIES_KEY);
+  await AsyncStorage.multiRemove([
+    ARRIVAL_NOTIFICATION_STATES_KEY,
+    LEGACY_NOTIFIED_MEMORIES_KEY,
+  ]);
   console.log('🧹 [Geofencing] Cleared notified memories');
 }
 
